@@ -1,0 +1,120 @@
+@import 'tailwindcss';
+/* Both builds (admin root src/web, portal root src/web/portal) share components, so scan all of src/web. */
+@source './';
+
+/* Semantic tokens. Dark is the default; light follows the OS preference. */
+:root {
+  --bg: #0b0f17;
+  --surface: #121826;
+  --surface-2: #1a2233;
+  --surface-3: #232d42;
+  --border: #263049;
+  --fg: #e6eaf2;
+  --muted: #8b95ab;
+  --accent: #f59e0b;
+  --accent-fg: #111827;
+  --ok: #22c55e;
+  --info: #3b82f6;
+  --warn: #f59e0b;
+  --bad: #ef4444;
+  --violet: #a78bfa;
+  --teal: #2dd4bf;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f6f9;
+    --surface: #ffffff;
+    --surface-2: #eef0f5;
+    --surface-3: #e2e6ee;
+    --border: #d5dae5;
+    --fg: #121826;
+    --muted: #5d6679;
+    --accent: #d97706;
+    --accent-fg: #ffffff;
+    --ok: #16a34a;
+    --info: #2563eb;
+    --warn: #d97706;
+    --bad: #dc2626;
+    --violet: #7c3aed;
+    --teal: #0d9488;
+    color-scheme: light;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-line: var(--border);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-ok: var(--ok);
+  --color-info: var(--info);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-violet: var(--violet);
+  --color-teal: var(--teal);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.scroll-row {
+  scrollbar-width: thin;
+  scroll-snap-type: x proximity;
+}
+.scroll-row > * {
+  scroll-snap-align: start;
+}
+
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2));
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+@keyframes shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+}
+
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+input,
+select,
+textarea {
+  color: inherit;
+}

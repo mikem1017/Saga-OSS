@@ -1,0 +1,63 @@
+# Example deployment: put this at /opt/saga/docker-compose.yml with the repo at /opt/saga/app and your .env next to it.
+# See docs/deployment.md.
+name: saga
+services:
+  saga:
+    build: ./app
+    image: saga:latest
+    container_name: saga
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      SAGA_SURFACE: admin
+    ports:
+      # Admin UI. Expose it only to your LAN/VPN, ideally behind a reverse proxy with TLS (see docs/security.md).
+      - "8080:3000"
+    volumes:
+      - ./data:/data
+      - ./ssh:/ssh:ro
+    # The internal portal API listens on 3001 inside the compose network only (never published).
+    expose:
+      - "3001"
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Optional public request portal. Same image, different entry point. Deliberately NO env_file: it gets only the
+  # internal URL + shared secret, no upstream keys and no database. portal-main.ts refuses to start if an admin
+  # secret is present. No ports: only cloudflared (same network) reaches it.
+  # Start it with: docker compose --profile portal up -d
+  saga-portal:
+    image: saga:latest
+    profiles: [portal, tunnel]
+    container_name: saga-portal
+    restart: unless-stopped
+    depends_on: [saga]
+    command: ["node_modules/.bin/tsx", "src/server/portal-main.ts"]
+    environment:
+      SAGA_SURFACE: portal
+      INTERNAL_URL: http://saga:3001
+      INTERNAL_SECRET: ${INTERNAL_SECRET:-}   # the portal refuses to start without it
+      PORTAL_PUBLIC_URL: ${PORTAL_PUBLIC_URL:-}
+    read_only: true
+    tmpfs: [/tmp]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Optional Cloudflare Tunnel connector: point a remotely managed tunnel's public hostname at http://saga-portal:3000.
+  # Start with: docker compose --profile tunnel up -d
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: saga-cloudflared
+    restart: unless-stopped
+    profiles: [tunnel]
+    depends_on: [saga-portal]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Start and watch maintenance-agent runs on behalf of Saga ("Ask the agent"). Install at
+/usr/local/bin/saga-agent-task on the host where your agent runs, and reach it only through a forced command:
+
+    command="sudo -n /usr/local/bin/saga-agent-task",from="<saga-host-ip>",restrict ssh-ed25519 AAAA... saga-ops@saga
+
+plus /etc/sudoers.d/saga-agent-task (sudo's env_reset would drop SSH_ORIGINAL_COMMAND, so keep it for this one script):
+
+    Defaults!/usr/local/bin/saga-agent-task env_keep += "SSH_ORIGINAL_COMMAND"
+    <login-user> ALL=(root) NOPASSWD: /usr/local/bin/saga-agent-task
+
+WARNING: this lets Saga start agent runs. If your agent executes commands without asking (most unattended agents
+do), you are giving the Saga admin UI a path to run things on your infrastructure. Only enable it if Saga's admin
+surface is private to you, and keep your agent's own guardrails in place. See docs/integrations.md.
+
+Settings: KEY=VALUE lines in /etc/saga-agent-task.env (root-owned):
+    AGENT_DIR       the agent's working directory; tasks go in AGENT_DIR/tasks/   (required)
+    AGENT_USER      user the agent runs as                                        (required)
+    AGENT_CMD       command run in AGENT_DIR as AGENT_USER; "{task}" is replaced by the task file's path relative to
+                    AGENT_DIR, e.g. ./run-agent --task {task}                       (required)
+    AGENT_LOGS      directory holding the agent's *-task.jsonl transcripts for live progress (default AGENT_DIR/logs)
+
+Contract with the agent: it reads tasks/<id>.json, and keeps tasks/<id>.status.json updated with
+{"state": "waiting"|"running"|"done"|"failed"|"refused", "started", "ended", "summary"}. The status file starts as
+"queued" (written here). Live progress lines are read from the newest *-task.jsonl (Claude Code stream-json) in AGENT_LOGS.
+
+Verbs (SSH_ORIGINAL_COMMAND):
+    start            task JSON on stdin -> {"id": ...}; starts the agent detached
+    status <id>      the task's status plus, while running, the agent's latest progress lines
+    list             the last 10 tasks
+
+The task is data, not a prompt: known fields only, bounded lengths, a fixed set of kinds, one task at a time.
+"""
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+
+
+def _settings():
+    out = {}
+    try:
+        with open("/etc/saga-agent-task.env") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+CFG = _settings()
+AGENT = CFG.get("AGENT_DIR", "")
+USER = CFG.get("AGENT_USER", "")
+AGENT_CMD = CFG.get("AGENT_CMD", "")
+TASKS = f"{AGENT}/tasks"
+LOGS = CFG.get("AGENT_LOGS", f"{AGENT}/logs")
+KINDS = {"download-problem", "lost-jobs", "stack-health"}
+ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+
+
+def out(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def refuse(msg):
+    out({"error": msg}, 2)
+
+
+def clean(v, limit):
+    if isinstance(v, (int, float, bool)) or v is None:
+        return v
+    if isinstance(v, str):
+        return v.replace("\x00", "")[:limit]
+    if isinstance(v, list):
+        return [clean(x, limit) for x in v[:50]]
+    if isinstance(v, dict):
+        return {str(k)[:40]: clean(x, limit) for k, x in list(v.items())[:40]}
+    return None
+
+
+def status(task_id):
+    try:
+        with open(f"{TASKS}/{task_id}.status.json") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def active():
+    if not os.path.isdir(TASKS):
+        return None
+    for f in sorted(os.listdir(TASKS), reverse=True):
+        if f.endswith(".status.json"):
+            st = status(f[: -len(".status.json")])
+            if st and st.get("state") in ("queued", "waiting", "running") and time.time() - st.get("created", 0) < 3 * 3600:
+                return st
+    return None
+
+
+def progress(st):
+    """Latest readable lines from the running transcript: the agent's text and the commands it runs."""
+    if st.get("state") != "running" or not os.path.isdir(LOGS):
+        return []
+    files = sorted(f for f in os.listdir(LOGS) if f.endswith("-task.jsonl"))
+    if not files:
+        return []
+    path = f"{LOGS}/{files[-1]}"
+    if os.path.getmtime(path) < st.get("started", 0) - 5:
+        return []
+    lines = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for raw in f.readlines()[-300:]:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            if ev.get("type") != "assistant":
+                continue
+            for c in ev.get("message", {}).get("content", []):
+                if c.get("type") == "text" and c.get("text", "").strip():
+                    lines.append(c["text"].strip()[:300])
+                elif c.get("type") == "tool_use":
+                    inp = c.get("input", {})
+                    lines.append(f"$ {(inp.get('command') or inp.get('file_path') or c.get('name'))!s}"[:200])
+    return lines[-12:]
+
+
+def start():
+    raw = sys.stdin.read(16385)
+    if len(raw) > 16384:
+        refuse("task too large")
+    try:
+        t = json.loads(raw)
+    except ValueError:
+        refuse("task is not JSON")
+    if not isinstance(t, dict) or t.get("kind") not in KINDS:
+        refuse(f"kind must be one of {sorted(KINDS)}")
+    if not isinstance(t.get("title"), str) or not t["title"].strip():
+        refuse("title required")
+    if active():
+        refuse("an agent task is already queued or running")
+    task_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+    task = {
+        "id": task_id,
+        "kind": t["kind"],
+        "title": clean(t["title"], 200),
+        "summary": clean(t.get("summary", ""), 2000),
+        "details": clean(t.get("details", {}), 1000),
+        "requestedBy": clean(t.get("requestedBy", "saga"), 80),
+        "created": int(time.time()),
+    }
+    os.makedirs(TASKS, exist_ok=True)
+    subprocess.run(["chown", f"{USER}:{USER}", TASKS], check=True)
+    path = f"{TASKS}/{task_id}.json"
+    with open(path, "w") as f:
+        json.dump(task, f, indent=1)
+    with open(f"{TASKS}/{task_id}.status.json", "w") as f:
+        json.dump({"id": task_id, "state": "queued", "created": task["created"], "title": task["title"], "kind": task["kind"]}, f)
+    subprocess.run(["chown", f"{USER}:{USER}", path, f"{TASKS}/{task_id}.status.json"], check=True)
+    home = os.path.expanduser(f"~{USER}")
+    cmd = [part.replace("{task}", f"tasks/{task_id}.json") for part in shlex.split(AGENT_CMD)]
+    subprocess.Popen(
+        ["runuser", "-u", USER, "--", "env", f"HOME={home}", "PATH=/usr/local/bin:/usr/bin:/bin", *cmd],
+        cwd=AGENT, start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    out({"id": task_id})
+
+
+def main():
+    if not AGENT or not USER or not AGENT_CMD or not os.path.isdir(AGENT):
+        refuse("not configured: set AGENT_DIR, AGENT_USER and AGENT_CMD in /etc/saga-agent-task.env")
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        refuse("unparseable command")
+    if argv == ["start"]:
+        return start()
+    if len(argv) == 2 and argv[0] == "status" and ID.match(argv[1]):
+        st = status(argv[1]) or refuse("no such task")
+        out({**st, "progress": progress(st)})
+    if argv == ["list"]:
+        ids = sorted((f[: -len(".status.json")] for f in os.listdir(TASKS) if f.endswith(".status.json")), reverse=True)[:10] if os.path.isdir(TASKS) else []
+        out({"tasks": [status(i) for i in ids], "active": active()})
+    refuse("unknown verb (allowed: start | status <id> | list)")
+
+
+if __name__ == "__main__":
+    main()

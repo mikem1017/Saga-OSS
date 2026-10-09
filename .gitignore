@@ -1,0 +1,13 @@
+node_modules
+dist
+data
+.env
+*.log
+.DS_Store
+.claude
+__pycache__/
+.env.*
+!.env.example
+ssh/
+*.db
+*.db-*

@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Stack update control for Saga. Install at /usr/local/bin/saga-ops on the host that runs your *arr/SABnzbd/Plex
+Docker Compose project, and reach it only through a forced command in that user's ~/.ssh/authorized_keys:
+
+    command="/usr/local/bin/saga-ops",from="<saga-host-ip>",restrict ssh-ed25519 AAAA... saga-ops@saga
+
+Use a key that is only for this (Saga's OPS_SSH_KEY), not the read-only feed key. See docs/integrations.md.
+
+Verbs (from SSH_ORIGINAL_COMMAND; anything else is refused):
+    versions [refresh]          running vs available image for every compose service
+    update <svc,svc,...|all>    start a detached update run; prints {"runId": ...}
+    status <runId>              one run's state
+    runs                        the last 10 runs
+    rollback <runId> [svc]      re-tag the run's old images and recreate those services
+
+Settings: optional KEY=VALUE lines in ~/.config/saga-ops.env (forced commands can't take environment variables):
+    COMPOSE_FILE      default ~/docker-compose.yml
+    SAB_CONFIG_DIR    default ~/appdata/sabnzbd   (sabnzbd.ini and logs/sabnzbd.log)
+    SAB_URL           default http://localhost:8080   (SABnzbd as reached from this host, for the post-processing check)
+    PP_GUARD_FLAG     default ~/.sab-pp-guard.paused  (a file whose presence means "a post-processing guard paused SAB")
+    SNAPSHOT_CMD      optional command run before each update (e.g. a config backup script)
+    HEALTH_<service>  health URL for a service, e.g. HEALTH_overseerr=http://localhost:5055/
+
+Rules:
+  - Refuses to touch sabnzbd while anything is post-processing or the PP guard holds a pause.
+  - One service at a time, sabnzbd last; each must answer its health URL within 3 minutes.
+  - Old image IDs are recorded first, so rollback works until `docker image prune` removes them.
+  - After sabnzbd restarts, jobs it couldn't load are listed as lostJobs (SAB 5.1 can't reload jobs that were
+    part-downloaded under 5.0). Saga re-searches them through Radarr/Sonarr.
+"""
+import concurrent.futures
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+
+
+def _settings():
+    out = {}
+    try:
+        with open(os.path.join(HOME, ".config", "saga-ops.env")) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = os.path.expanduser(v.strip().strip("'\""))
+    except OSError:
+        pass
+    return out
+
+
+CFG = _settings()
+COMPOSE = CFG.get("COMPOSE_FILE", f"{HOME}/docker-compose.yml")
+DATA = f"{HOME}/saga-ops"
+RUNS = f"{DATA}/runs"
+LOCK = f"{DATA}/.lock"
+REMOTE_CACHE = f"{DATA}/remote-cache.json"
+REMOTE_TTL = 30 * 60
+SAB_DIR = CFG.get("SAB_CONFIG_DIR", f"{HOME}/appdata/sabnzbd")
+SAB_INI = f"{SAB_DIR}/sabnzbd.ini"
+SAB_LOG = f"{SAB_DIR}/logs/sabnzbd.log"
+SAB_URL = CFG.get("SAB_URL", "http://localhost:8080").rstrip("/")
+GUARD_FLAG = CFG.get("PP_GUARD_FLAG", f"{HOME}/.sab-pp-guard.paused")
+SNAPSHOT_CMD = CFG.get("SNAPSHOT_CMD", "")
+RUN_ID = re.compile(r"^\d{8}-\d{6}$")
+HEALTH = {  # anything that returns HTTP < 500 counts as up; SAB's web root, never /api (keyless /api calls raise a UI warning)
+    "radarr": "http://localhost:7878/ping",
+    "sonarr": "http://localhost:8989/ping",
+    "lidarr": "http://localhost:8686/ping",
+    "prowlarr": "http://localhost:9696/ping",
+    "sabnzbd": f"{SAB_URL}/",
+    "tautulli": "http://localhost:8181/",
+    "plex": "http://localhost:32400/identity",
+    **{k[len("HEALTH_"):]: v for k, v in CFG.items() if k.startswith("HEALTH_")},
+}
+PP_STATES = {"Queued", "QuickCheck", "Verifying", "Repairing", "Fetching", "Extracting", "Moving", "Running"}
+
+
+def out(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def refuse(msg):
+    out({"error": msg}, 2)
+
+
+def sh(args, timeout=600):
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=HOME)
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def compose_services():
+    rc, o, e = sh(["docker", "compose", "-f", COMPOSE, "config", "--format", "json"], 60)
+    if rc:
+        raise RuntimeError(e[-300:])
+    return {n: s.get("image") for n, s in json.loads(o)["services"].items()}
+
+
+def container_info(svc):
+    rc, o, _ = sh(["docker", "inspect", svc, "--format", "{{json .}}"], 30)
+    if rc:
+        return None
+    c = json.loads(o)
+    return {"image": c["Image"], "state": c["State"]["Status"], "started": c["State"].get("StartedAt")}
+
+
+def image_info(ref):
+    rc, o, _ = sh(["docker", "image", "inspect", ref, "--format", "{{json .}}"], 30)
+    if rc:
+        return None
+    i = json.loads(o)
+    labels = (i.get("Config") or {}).get("Labels") or {}
+    return {"id": i["Id"], "repoDigests": i.get("RepoDigests") or [], "version": version_of(labels), "created": i.get("Created")}
+
+
+def version_of(labels):
+    return labels.get("org.opencontainers.image.version") or (labels.get("build_version") or "").replace("Linuxserver.io version:- ", "").split(" ")[0] or None
+
+
+def remote(ref):
+    rc, o, e = sh(["docker", "buildx", "imagetools", "inspect", ref, "--format", "{{json .Manifest}}"], 60)
+    if rc:
+        return {"error": (e or o)[-200:]}
+    digest = json.loads(o).get("digest")
+    version = None
+    rc2, o2, _ = sh(["docker", "buildx", "imagetools", "inspect", ref, "--format", "{{json .Image}}"], 60)
+    if not rc2 and o2:
+        try:
+            d = json.loads(o2)
+            img = d.get("linux/amd64", d) if isinstance(d, dict) else d
+            version = version_of((img.get("config") or {}).get("Labels") or {})
+        except (ValueError, AttributeError):
+            pass
+    return {"digest": digest, "version": version}
+
+
+def remote_all(images, refresh):
+    try:
+        cache = json.load(open(REMOTE_CACHE))
+    except (OSError, ValueError):
+        cache = {}
+    now = time.time()
+    todo = [r for r in set(images) if refresh or r not in cache or now - cache[r].get("at", 0) > REMOTE_TTL]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        for ref, res in zip(todo, ex.map(remote, todo)):
+            cache[ref] = {**res, "at": now}
+    os.makedirs(DATA, exist_ok=True)
+    json.dump(cache, open(REMOTE_CACHE, "w"))
+    return cache
+
+
+def versions(refresh=False):
+    svcs = compose_services()
+    rem = remote_all([i for i in svcs.values() if i], refresh)
+    rows = []
+    for svc, ref in sorted(svcs.items()):
+        c = container_info(svc)
+        local = image_info(ref) if ref else None
+        running = image_info(c["image"]) if c else None
+        r = rem.get(ref, {})
+        digests = [d.split("@")[-1] for d in (local or {}).get("repoDigests", [])]
+        rows.append({
+            "service": svc,
+            "image": ref,
+            "state": c["state"] if c else "missing",
+            "runningVersion": (running or {}).get("version"),
+            "runningImage": (c or {}).get("image"),
+            "pulledVersion": (local or {}).get("version"),
+            "remoteVersion": r.get("version"),
+            "remoteError": r.get("error"),
+            "checkedAt": int(r.get("at", 0)),
+            "updateAvailable": bool(r.get("digest")) and r.get("digest") not in digests,
+            "restartNeeded": bool(c and local and c["image"] != local["id"]),
+        })
+    out({"ts": int(time.time()), "services": rows, "preflight": preflight()})
+
+
+def sab_key():
+    for _ in range(5):
+        try:
+            m = re.search(r"^api_key = (\S+)", open(SAB_INI).read(), re.M)
+            if m:
+                return m.group(1)
+        except OSError:
+            pass
+        time.sleep(1)
+    return None
+
+
+def preflight():
+    key = sab_key()
+    pp = None
+    if key:
+        try:
+            with urllib.request.urlopen(f"{SAB_URL}/api?mode=history&limit=50&output=json&apikey={key}", timeout=20) as r:
+                pp = sum(1 for s in json.load(r)["history"]["slots"] if s["status"] in PP_STATES)
+        except Exception:  # noqa: BLE001
+            pp = None
+    return {"ppPending": pp, "guardPaused": os.path.exists(GUARD_FLAG), "runActive": run_active()}
+
+
+def run_active():
+    try:
+        f = open(LOCK, "a")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+
+
+def recent_queued(seconds):
+    if not os.path.isdir(RUNS):
+        return False
+    now = time.time()
+    for f in sorted(os.listdir(RUNS), reverse=True)[:5]:
+        try:
+            st = json.load(open(f"{RUNS}/{f}"))
+        except (OSError, ValueError):
+            continue
+        if st.get("status") == "queued" and now - st.get("started", 0) < seconds:
+            return True
+    return False
+
+
+def save(state):
+    p = f"{RUNS}/{state['id']}.json"
+    tmp = p + ".tmp"
+    json.dump(state, open(tmp, "w"), indent=1)
+    os.replace(tmp, p)
+
+
+def load(run_id):
+    if not RUN_ID.match(run_id):
+        refuse("bad run id")
+    try:
+        return json.load(open(f"{RUNS}/{run_id}.json"))
+    except OSError:
+        refuse("no such run")
+
+
+def healthy(svc, timeout=180):
+    url = HEALTH.get(svc)
+    end = time.time() + timeout
+    while time.time() < end:
+        c = container_info(svc)
+        if c and c["state"] == "running":
+            if not url:
+                return True, "running"
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    return True, f"HTTP {r.status}"
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    return True, f"HTTP {e.code}"
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(3)
+    return False, "no response within 3 min"
+
+
+def lost_jobs(since_epoch):
+    """Jobs SAB couldn't load on its last start (their folder names)."""
+    names = []
+    try:
+        lines = open(SAB_LOG, errors="replace").read().splitlines()[-20000:]
+    except OSError:
+        return names
+    for line in lines:
+        if "nzo_data failed" not in line or "ERROR" not in line:
+            continue
+        try:
+            ts = time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        m = re.search(r"/incomplete/(.+?)/__ADMIN__/", line)
+        if ts >= since_epoch - 5 and m:
+            names.append(m.group(1))
+    return sorted(set(names))
+
+
+def update(spec):
+    svcs = compose_services()
+    want = sorted(svcs) if spec == "all" else spec.split(",")
+    bad = [s for s in want if s not in svcs]
+    if bad or not want:
+        refuse(f"unknown service(s): {', '.join(bad) or '(none)'}")
+    order = [s for s in want if s != "sabnzbd"] + (["sabnzbd"] if "sabnzbd" in want else [])
+    pf = preflight()
+    if pf["runActive"]:
+        refuse("another update run is in progress")
+    if recent_queued(60):
+        refuse("an update run was queued in the last minute and hasn't started; check its status")
+    if "sabnzbd" in order and (pf["guardPaused"] or pf["ppPending"]):
+        refuse(f"SABnzbd is post-processing ({pf['ppPending']} job(s)) or the PP guard holds a pause; try again shortly")
+    if "sabnzbd" in order and pf["ppPending"] is None:
+        refuse("couldn't read SABnzbd's post-processing state")
+    os.makedirs(RUNS, exist_ok=True)
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    save({"id": run_id, "services": order, "status": "queued", "started": int(time.time()), "finished": None,
+          "steps": [{"service": s, "phase": "waiting"} for s in order], "lostJobs": [], "rollback": None, "log": []})
+    # The worker must not see SSH_ORIGINAL_COMMAND, or it re-runs update() instead of working and chains empty runs.
+    env = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "__worker", run_id], start_new_session=True, env=env,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=HOME)
+    out({"runId": run_id, "services": order})
+
+
+def worker(run_id):
+    lock = open(LOCK, "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    state = load(run_id)
+    svcs = compose_services()
+    state["status"] = "running"
+
+    def note(msg):
+        state["log"].append(f"{time.strftime('%H:%M:%S')} {msg}")
+        save(state)
+
+    if SNAPSHOT_CMD:
+        rc, o, e = sh(shlex.split(SNAPSHOT_CMD), 120)
+        note(f"snapshot: {(o or e)[-160:]}")
+    failed = False
+    for step in state["steps"]:
+        svc, ref = step["service"], svcs[step["service"]]
+        if failed:
+            step["phase"] = "skipped"
+            continue
+        c = container_info(svc)
+        old = image_info(c["image"]) if c else None
+        step.update(phase="pulling", oldImage=(c or {}).get("image"), oldVersion=(old or {}).get("version"))
+        note(f"{svc}: pulling {ref}")
+        rc, o, e = sh(["docker", "compose", "-f", COMPOSE, "pull", svc], 900)
+        if rc:
+            step.update(phase="failed", ok=False, message=f"pull failed: {e[-200:]}")
+            note(f"{svc}: pull failed")
+            failed = True
+            continue
+        new = image_info(ref)
+        step["newImage"], step["newVersion"] = new["id"], new["version"]
+        if c and new["id"] == c["image"]:
+            step.update(phase="current", ok=True, message="already up to date")
+            note(f"{svc}: already up to date")
+            continue
+        if svc == "sabnzbd":
+            pf = preflight()
+            if pf["guardPaused"] or pf["ppPending"]:
+                step.update(phase="failed", ok=False, message="SABnzbd started post-processing; pulled but not restarted")
+                note("sabnzbd: post-processing started, not restarting")
+                failed = True
+                continue
+        step["phase"] = "restarting"
+        restarted_at = time.time()
+        note(f"{svc}: recreating ({step.get('oldVersion')} -> {step.get('newVersion')})")
+        rc, o, e = sh(["docker", "compose", "-f", COMPOSE, "up", "-d", svc], 600)
+        ok, msg = (False, e[-200:]) if rc else healthy(svc)
+        step.update(phase="done" if ok else "failed", ok=ok, message=msg)
+        note(f"{svc}: {'healthy' if ok else 'NOT healthy'} ({msg})")
+        if not ok:
+            failed = True
+        if svc == "sabnzbd" and ok:
+            time.sleep(20)  # let SAB finish loading its queue before reading the log
+            state["lostJobs"] = lost_jobs(restarted_at)
+            if state["lostJobs"]:
+                note(f"sabnzbd: {len(state['lostJobs'])} job(s) failed to load and dropped out of the queue")
+    state["status"] = "failed" if failed else "done"
+    state["finished"] = int(time.time())
+    save(state)
+    try:
+        os.remove(REMOTE_CACHE)  # versions changed; re-check on next view
+    except OSError:
+        pass
+
+
+def rollback(run_id, only=None):
+    state = load(run_id)
+    svcs = compose_services()
+    targets = [s for s in state["steps"] if s.get("oldImage") and s.get("newImage") and s["oldImage"] != s["newImage"]
+               and s.get("phase") in ("done", "failed") and (only is None or s["service"] == only)]
+    if only and not targets:
+        refuse(f"nothing to roll back for {only} in this run")
+    if run_active():
+        refuse("an update run is in progress")
+    res = []
+    for s in targets:
+        svc = s["service"]
+        if svc == "sabnzbd":
+            pf = preflight()
+            if pf["guardPaused"] or pf["ppPending"]:
+                res.append({"service": svc, "ok": False, "message": "SABnzbd is post-processing; try again shortly"})
+                continue
+        rc, _, e = sh(["docker", "tag", s["oldImage"], svcs[svc]], 60)
+        if rc:
+            res.append({"service": svc, "ok": False, "message": f"old image gone: {e[-160:]}"})
+            continue
+        rc, _, e = sh(["docker", "compose", "-f", COMPOSE, "up", "-d", svc], 600)
+        ok, msg = (False, e[-200:]) if rc else healthy(svc)
+        res.append({"service": svc, "ok": ok, "message": f"back on {s.get('oldVersion') or s['oldImage'][:19]} ({msg})"})
+    state["rollback"] = {"at": int(time.time()), "results": res}
+    save(state)
+    out(state)
+
+
+def main():
+    # A forced command can't pass argv (the client's command arrives only in SSH_ORIGINAL_COMMAND), so an argv of
+    # "__worker <id>" can only come from update() on this host.
+    if len(sys.argv) == 3 and sys.argv[1] == "__worker" and RUN_ID.match(sys.argv[2]):
+        return worker(sys.argv[2])
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    if len(raw) > 300:
+        refuse("command too long")
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        refuse("unparseable command")
+    if argv == ["versions"] or argv == ["versions", "refresh"]:
+        return versions(refresh=len(argv) == 2)
+    if len(argv) == 2 and argv[0] == "update" and re.fullmatch(r"all|[a-z0-9_-]+(,[a-z0-9_-]+)*", argv[1]):
+        return update(argv[1])
+    if len(argv) == 2 and argv[0] == "status":
+        out(load(argv[1]))
+    if argv == ["runs"]:
+        os.makedirs(RUNS, exist_ok=True)
+        ids = sorted((f[:-5] for f in os.listdir(RUNS) if f.endswith(".json")), reverse=True)[:10]
+        out({"runs": [load(i) for i in ids], "preflight": preflight()})
+    if len(argv) in (2, 3) and argv[0] == "rollback" and (len(argv) == 2 or re.fullmatch(r"[a-z0-9_-]+", argv[2])):
+        return rollback(argv[1], argv[2] if len(argv) == 3 else None)
+    refuse("unknown verb (allowed: versions [refresh] | update <svc,...|all> | status <id> | runs | rollback <id> [svc])")
+
+
+if __name__ == "__main__":
+    main()
